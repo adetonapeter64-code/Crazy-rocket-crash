@@ -1,77 +1,120 @@
-"""
-db.py
-Handles the play-money ledger using SQLite.
-Every balance change is written here so it survives server restarts.
-"""
-import sqlite3
-import os
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Play-Money Crash Game</title>
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<style>
+body { background:#0f0f1a; color:#fff; font-family:sans-serif; text-align:center; }
+#multiplier { font-size:64px; margin:20px; }
+#canvas { background:#1a1a2e; border-radius:8px; max-width:95%; }
+button { font-size:18px; padding:10px 20px; margin:5px; border:none; border-radius:6px; cursor:pointer; }
+#betBtn { background:#4caf50; color:#fff; }
+#cashoutBtn { background:#f44336; color:#fff; }
+input { font-size:18px; padding:8px; width:100px; }
+</style>
+</head>
+<body>
+<h1>Crash (Play Money)</h1>
+<p>Balance: <span id="balance">-</span> credits</p>
+<div id="multiplier">1.00x</div>
+<canvas id="canvas" width="600" height="300"></canvas>
+<br>
+<input id="betAmount" type="number" value="100">
+<button id="betBtn" onclick="placeBet()">Bet</button>
+<button id="cashoutBtn" onclick="cashOut()">Cash Out</button>
+<p id="status">Connecting...</p>
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "crash_game.db")
+<script>
+const socket = io();
+let sessionId = null;
+let balance = 0;
+let history = [];
 
-def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+async function join() {
+  const res = await fetch('/api/join', { method: 'POST' });
+  const data = await res.json();
+  sessionId = data.session_id;
+  balance = data.balance;
+  document.getElementById('balance').innerText = (balance/100).toFixed(2);
+}
+join();
 
-def init_db():
-    conn = get_connection()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS players (
-            session_id TEXT PRIMARY KEY,
-            name TEXT,
-            balance INTEGER NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS ledger (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            change_amount INTEGER NOT NULL,
-            reason TEXT NOT NULL,
-            round_nonce INTEGER,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+async function placeBet() {
+  const amount = Math.round(document.getElementById('betAmount').value * 100);
+  const res = await fetch('/api/bet', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({session_id: sessionId, amount: amount})
+  });
+  const data = await res.json();
+  if (data.balance !== undefined) {
+    balance = data.balance;
+    document.getElementById('balance').innerText = (balance/100).toFixed(2);
+    document.getElementById('status').innerText = 'Bet placed!';
+  } else {
+    document.getElementById('status').innerText = data.error;
+  }
+}
 
-def create_player(session_id, name, starting_balance):
-    conn = get_connection()
-    conn.execute(
-        "INSERT OR IGNORE INTO players (session_id, name, balance) VALUES (?, ?, ?)",
-        (session_id, name, starting_balance)
-    )
-    conn.commit()
-    conn.close()
+async function cashOut() {
+  const res = await fetch('/api/cashout', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({session_id: sessionId})
+  });
+  const data = await res.json();
+  if (data.balance !== undefined) {
+    balance = data.balance;
+    document.getElementById('balance').innerText = (balance/100).toFixed(2);
+    document.getElementById('status').innerText =
+      'Cashed out at ' + data.cashed_out_at.toFixed(2) + 'x, won ' + (data.winnings/100).toFixed(2);
+  } else {
+    document.getElementById('status').innerText = data.error;
+  }
+}
 
-def get_player(session_id):
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM players WHERE session_id = ?", (session_id,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
+socket.on('round_waiting', (data) => {
+  document.getElementById('status').innerText = 'Betting open! Seed hash: ' + data.seed_hash.slice(0,16) + '...';
+  document.getElementById('multiplier').innerText = '1.00x';
+  history = [];
+  clearCanvas();
+});
 
-def change_balance(session_id, delta, reason, round_nonce=None):
-    """Apply a balance change AND log it, in one atomic transaction.
-    This is the key idea of a ledger: never just overwrite a balance,
-    always record why it changed, so you can audit every credit later."""
-    conn = get_connection()
-    try:
-        conn.execute("BEGIN")
-        row = conn.execute("SELECT balance FROM players WHERE session_id = ?", (session_id,)).fetchone()
-        if row is None:
-            raise ValueError("Player not found")
-        new_balance = row["balance"] + delta
-        if new_balance < 0:
-            raise ValueError("Insufficient balance")
-        conn.execute("UPDATE players SET balance = ? WHERE session_id = ?", (new_balance, session_id))
-        conn.execute(
-            "INSERT INTO ledger (session_id, change_amount, reason, round_nonce) VALUES (?, ?, ?, ?)",
-            (session_id, delta, reason, round_nonce)
-        )
-        conn.commit()
-        return new_balance
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+socket.on('round_started', () => {
+  document.getElementById('status').innerText = 'Round running!';
+});
+
+socket.on('state_update', (data) => {
+  document.getElementById('multiplier').innerText = data.multiplier.toFixed(2) + 'x';
+  if (data.phase === 'running' || data.phase === 'crashed') {
+    history.push(data.multiplier);
+    drawCurve();
+  }
+});
+
+socket.on('round_crashed', (data) => {
+  document.getElementById('status').innerText =
+    'Crashed at ' + data.crash_point.toFixed(2) + 'x. Seed revealed: ' + data.server_seed.slice(0,16) + '...';
+});
+
+function clearCanvas() {
+  const ctx = document.getElementById('canvas').getContext('2d');
+  ctx.clearRect(0, 0, 600, 300);
+}
+
+function drawCurve() {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, 600, 300);
+  ctx.strokeStyle = '#4caf50';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  history.forEach((m, i) => {
+    const x = i * (600 / Math.max(history.length, 100));
+    const y = 300 - Math.min((m - 1) * 60, 290);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+</script>
+</body>
+</html>
