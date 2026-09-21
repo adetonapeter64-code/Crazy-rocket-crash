@@ -1,7 +1,8 @@
 """
-app.py - play-money crash game server (deployment-ready, flat folder).
+app.py - play-money crash game server with admin panel.
 """
 import os
+import hmac
 import time
 import threading
 import uuid
@@ -19,6 +20,11 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 db.init_db()
 
+# Set ADMIN_PASSWORD as an environment variable on Render. Default is only for testing.
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
+
+config = {"house_edge": 0.01, "paused": False}
+
 round_state = {
     "phase": "waiting",
     "multiplier": 1.0,
@@ -34,6 +40,11 @@ lock = threading.Lock()
 STARTING_BALANCE = 100000  # play money in cents = 1000.00 credits
 
 
+def is_admin(req):
+    supplied = req.headers.get("X-Admin-Password", "")
+    return hmac.compare_digest(supplied.encode(), ADMIN_PASSWORD.encode())
+
+
 def broadcast_state():
     socketio.emit("state_update", {
         "phase": round_state["phase"],
@@ -43,6 +54,12 @@ def broadcast_state():
 
 def game_loop():
     while True:
+        if config["paused"]:
+            with lock:
+                round_state["phase"] = "paused"
+            time.sleep(1)
+            continue
+
         with lock:
             round_state["phase"] = "waiting"
             round_state["multiplier"] = 1.0
@@ -50,15 +67,18 @@ def game_loop():
             round_state["server_seed"] = generate_server_seed()
             round_state["server_seed_hash"] = hash_seed(round_state["server_seed"])
             round_state["nonce"] += 1
+            edge = config["house_edge"]
         socketio.emit("round_waiting", {
             "seed_hash": round_state["server_seed_hash"],
             "countdown": 5,
+            "house_edge": edge,
         })
         time.sleep(5)
 
         with lock:
             round_state["crash_point"] = generate_crash_point(
-                round_state["server_seed"], round_state["client_seed"], round_state["nonce"]
+                round_state["server_seed"], round_state["client_seed"],
+                round_state["nonce"], house_edge=edge
             )
             round_state["phase"] = "running"
             round_state["start_time"] = time.time()
@@ -85,6 +105,8 @@ def game_loop():
         })
         time.sleep(3)
 
+
+# ---------------- Player routes ----------------
 
 @app.route("/")
 def index():
@@ -143,6 +165,73 @@ def cashout():
         bet["cashout_at"] = current_multiplier
         new_balance = db.change_balance(session_id, winnings, "cash_out", round_state["nonce"])
     return jsonify({"balance": new_balance, "cashed_out_at": current_multiplier, "winnings": winnings})
+
+
+# ---------------- Admin routes ----------------
+
+@app.route("/admin")
+def admin_page():
+    return send_from_directory(BASE_DIR, "admin.html")
+
+
+@app.route("/admin/api/stats")
+def admin_stats():
+    if not is_admin(request):
+        return jsonify({"error": "Wrong password"}), 401
+    conn = db.get_connection()
+    total_bet = conn.execute(
+        "SELECT COALESCE(-SUM(change_amount), 0) FROM ledger WHERE reason = 'bet_placed'").fetchone()[0]
+    total_paid = conn.execute(
+        "SELECT COALESCE(SUM(change_amount), 0) FROM ledger WHERE reason = 'cash_out'").fetchone()[0]
+    players = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+    conn.close()
+    return jsonify({
+        "rounds_played": round_state["nonce"],
+        "players": players,
+        "total_bet": total_bet,
+        "total_paid": total_paid,
+        "house_profit": total_bet - total_paid,
+        "house_edge_percent": round(config["house_edge"] * 100, 2),
+        "paused": config["paused"],
+        "phase": round_state["phase"],
+    })
+
+
+@app.route("/admin/api/house_edge", methods=["POST"])
+def admin_house_edge():
+    if not is_admin(request):
+        return jsonify({"error": "Wrong password"}), 401
+    data = request.json or {}
+    try:
+        percent = float(data.get("percent"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Enter a number"}), 400
+    if percent < 0 or percent > 20:
+        return jsonify({"error": "House edge must be between 0 and 20 percent"}), 400
+    config["house_edge"] = percent / 100.0
+    return jsonify({"house_edge_percent": percent, "note": "Applies from the next round"})
+
+
+@app.route("/admin/api/pause", methods=["POST"])
+def admin_pause():
+    if not is_admin(request):
+        return jsonify({"error": "Wrong password"}), 401
+    data = request.json or {}
+    config["paused"] = bool(data.get("paused"))
+    return jsonify({"paused": config["paused"]})
+
+
+@app.route("/admin/api/reset_balances", methods=["POST"])
+def admin_reset():
+    if not is_admin(request):
+        return jsonify({"error": "Wrong password"}), 401
+    with lock:
+        conn = db.get_connection()
+        conn.execute("UPDATE players SET balance = ?", (STARTING_BALANCE,))
+        conn.commit()
+        conn.close()
+        round_state["bets"] = {}
+    return jsonify({"ok": True})
 
 
 # Start the game loop when the server loads (works locally and under gunicorn)
