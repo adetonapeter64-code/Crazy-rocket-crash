@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crash Admin</title>
+<style>
+body { background:#0f0f1a; color:#fff; font-family:sans-serif; padding:16px; max-width:480px; margin:auto; }
+.card { background:#1a1a2e; border-radius:10px; padding:14px; margin:12px 0; }
+input { font-size:18px; padding:8px; width:120px; }
+button { font-size:16px; padding:10px 16px; margin:6px 4px 0 0; border:none; border-radius:6px; cursor:pointer; color:#fff; background:#4caf50; }
+button.red { background:#f44336; }
+button.grey { background:#555; }
+.row { display:flex; justify-content:space-between; padding:4px 0; }
+#msg { color:#ffca28; min-height:22px; }
+</style>
+</head>
+<body>
+<h2>Crash Admin (Play Money)</h2>
+
+<div class="card" id="loginCard">
+  <input id="pw" type="password" placeholder="Admin password" style="width:90%">
+  <br><button onclick="login()">Log in</button>
+</div>
+
+<div id="panel" style="display:none">
+  <div class="card">
+    <h3>Stats</h3>
+    <div class="row"><span>Rounds played</span><b id="s_rounds">-</b></div>
+    <div class="row"><span>Players</span><b id="s_players">-</b></div>
+    <div class="row"><span>Total bet</span><b id="s_bet">-</b></div>
+    <div class="row"><span>Total paid out</span><b id="s_paid">-</b></div>
+    <div class="row"><span>House profit</span><b id="s_profit">-</b></div>
+    <div class="row"><span>Round state</span><b id="s_phase">-</b></div>
+    <button class="grey" onclick="loadStats()">Refresh</button>
+  </div>
+
+  <div class="card">
+    <h3>House edge</h3>
+    <p>Current: <b id="s_edge">-</b>%. Higher edge means players crash sooner on average. Applies from the next round.</p>
+    <input id="edge" type="number" step="0.1" min="0" max="20"> %
+    <br><button onclick="setEdge()">Save house edge</button>
+  </div>
+
+  <div class="card">
+    <h3>Rounds</h3>
+    <p>Status: <b id="s_paused">-</b></p>
+    <button class="red" onclick="setPause(true)">Pause</button>
+    <button onclick="setPause(false)">Resume</button>
+  </div>
+
+  <div class="card">
+    <h3>Reset</h3>
+    <button class="red" onclick="resetBalances()">Reset all balances to 1000</button>
+  </div>
+</div>
+
+<p id="msg"></p>
+
+<script>
+let password = "";
+
+function fmt(cents) { return (cents / 100).toFixed(2); }
+function say(t) { document.getElementById('msg').innerText = t; }
+
+async function api(path, method, body) {
+  const res = await fetch(path, {
+    method: method || 'GET',
+    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Request failed');
+  return data;
+}
+
+async function login() {
+  password = document.getElementById('pw').value;
+  try {
+    await loadStats();
+    document.getElementById('loginCard').style.display = 'none';
+    document.getElementById('panel').style.display = 'block';
+    say('');
+  } catch (e) { say(e.message); }
+}
+
+async function loadStats() {
+  const s = await api('/admin/api/stats');
+  document.getElementById('s_rounds').innerText = s.rounds_played;
+  document.getElementById('s_players').innerText = s.players;
+  document.getElementById('s_bet').innerText = fmt(s.total_bet);
+  document.getElementById('s_paid').innerText = fmt(s.total_paid);
+  document.getElementById('s_profit').innerText = fmt(s.house_profit);
+  document.getElementById('s_phase').innerText = s.phase;
+  document.getElementById('s_edge').innerText = s.house_edge_percent;
+  document.getElementById('s_paused').innerText = s.paused ? 'PAUSED' : 'Running';
+  document.getElementById('edge').value = s.house_edge_percent;
+}
+
+async function setEdge() {
+  try {
+    const r = await api('/admin/api/house_edge', 'POST', { percent: document.getElementById('edge').value });
+    say('Saved: ' + r.house_edge_percent + '%. ' + r.note);
+    loadStats();
+  } catch (e) { say(e.message); }
+}
+
+async function setPause(p) {
+  try { await api('/admin/api/pause', 'POST', { paused: p }); say(p ? 'Paused after the current round.' : 'Resumed.'); loadStats(); }
+  catch (e) { say(e.message); }
+}
+
+async function resetBalances() {
+  if (!confirm('Reset every player balance to 1000?')) return;
+  try { await api('/admin/api/reset_balances', 'POST', {}); say('All balances reset.'); loadStats(); }
+  catch (e) { say(e.message); }
+}
+</script>
+</body>
+</html>
